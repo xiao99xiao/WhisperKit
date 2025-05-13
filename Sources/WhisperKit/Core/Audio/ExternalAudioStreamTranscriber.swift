@@ -83,7 +83,9 @@ public actor ExternalAudioStreamTranscriber {
   public func startStreamTranscription() async throws {
     guard !state.isProcessing else { return }
     state.isProcessing = true
-    await realtimeLoop()
+    Task { [weak self] in
+      await self?.realtimeLoop()
+    }
     Logging.info("External audio stream transcription has started")
   }
 
