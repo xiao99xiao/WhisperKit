@@ -43,6 +43,8 @@ public actor ExternalAudioStreamTranscriber {
 
   // 存储外部传入的音频样本
   private var audioSamples: [Float] = []
+  private var audioEnergy: [(rel: Float, avg: Float, max: Float, min: Float)] = []
+  private var relativeEnergyWindow: Int = 20
 
   public init(
     audioEncoder: any AudioEncoding,
@@ -131,29 +133,26 @@ public actor ExternalAudioStreamTranscriber {
     let nextBufferSeconds = Float(nextBufferSize) / Float(WhisperKit.sampleRate)
 
     // 只有当缓冲区至少有1秒的音频时才进行转录
-    guard nextBufferSize > 1 else {
+    guard nextBufferSize > WhisperKit.sampleRate else {  // 确保至少有1秒的音频
       if state.currentText == "" {
         state.currentText = "Waiting for audio..."
       }
-      return try await Task.sleep(nanoseconds: 100_000_000)  // 休眠100ms等待下一个缓冲区
+      return try await Task.sleep(nanoseconds: 1_000_000_000)  // 休眠1秒等待下一个缓冲区
     }
 
     if useVAD {
-      // 计算音频能量
-      let energy = calculateAudioEnergy(audioSamples[state.lastBufferSize..<audioSamples.count])
       let voiceDetected = AudioProcessor.isVoiceDetected(
-        in: [energy],
+        in: audioEnergy.map { $0.rel },
         nextBufferInSeconds: nextBufferSeconds,
         silenceThreshold: silenceThreshold
       )
-
       // 只有当检测到声音时才进行转录
       if !voiceDetected {
         Logging.debug("No voice detected, skipping transcribe")
         if state.currentText == "" {
           state.currentText = "Waiting for speech..."
         }
-        return try await Task.sleep(nanoseconds: 100_000_000)
+        return try await Task.sleep(nanoseconds: 1_000_000_000)  // 休眠1秒
       }
     }
 
@@ -225,10 +224,36 @@ public actor ExternalAudioStreamTranscriber {
 
   // 计算音频能量
   private func calculateAudioEnergy(_ samples: ArraySlice<Float>) -> Float {
-    var energy: Float = 0
-    samples.withUnsafeBufferPointer { buffer in
-      vDSP_measqv(buffer.baseAddress!, 1, &energy, vDSP_Length(samples.count))
+    let samplesArray = Array(samples)
+    var rmsEnergy: Float = 0.0
+    var minEnergy: Float = 0.0
+    var maxEnergy: Float = 0.0
+
+    // Calculate the root mean square of the signal
+    vDSP_rmsqv(samplesArray, 1, &rmsEnergy, vDSP_Length(samplesArray.count))
+
+    // Calculate the maximum sample value of the signal
+    vDSP_maxmgv(samplesArray, 1, &maxEnergy, vDSP_Length(samplesArray.count))
+
+    // Calculate the minimum sample value of the signal
+    vDSP_minmgv(samplesArray, 1, &minEnergy, vDSP_Length(samplesArray.count))
+
+    // Find the lowest average energy of the last 20 buffers ~2 seconds
+    let minAvgEnergy = self.audioEnergy.suffix(relativeEnergyWindow).reduce(Float.infinity) {
+      min($0, $1.avg)
     }
-    return energy / Float(samples.count)
+    let relativeEnergy = AudioProcessor.calculateRelativeEnergy(
+      of: samplesArray, relativeTo: minAvgEnergy)
+
+    // Update energy for buffers with valid data
+    let newEnergy = (relativeEnergy, rmsEnergy, maxEnergy, minEnergy)
+    self.audioEnergy.append(newEnergy)
+
+    return relativeEnergy
+  }
+
+  private func isVoiceDetected(_ samples: ArraySlice<Float>) -> Bool {
+    let relativeEnergy = calculateAudioEnergy(samples)
+    return relativeEnergy > silenceThreshold
   }
 }
